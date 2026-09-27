@@ -1,0 +1,35 @@
+name: build-ios-reader
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ldid
+        run: brew install ldid
+
+      - name: Build iOS arm64 binary
+        run: |
+          set -x
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "SDK=$SDK"
+          clang -arch arm64 -isysroot "$SDK" -miphoneos-version-min=13.0 \
+                -O2 -Wall -o reader main.c
+          file reader
+
+      - name: Sign with entitlements (ldid ad-hoc)
+        run: |
+          ldid -Sentitlements.plist reader
+          echo "--- entitlements embedded ---"
+          ldid -e reader || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: reader
+          path: reader

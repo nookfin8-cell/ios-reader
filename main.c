@@ -75,7 +75,8 @@ static int scan_once(mach_port_name_t task, int dump_all, int pass){
                 double prr = (double)pr/(double)lim;
                 unsigned long ind = countsub(buf,lim,";0;")+countsub(buf,lim,";5;")+countsub(buf,lim,";10;");
                 unsigned long mangled = countsub(buf,lim,"_Z")+countsub(buf,lim,"__Z");
-                int is_bi = (ind > 20 || mangled > 20) && prr > 0.55 && semi > 50;
+                // real decrypted bi.txt = high-printable TEXT with many ;N; binding records
+                int is_bi = (ind >= 8) && prr > 0.80 && semi > 100;
                 if (is_bi || dump_all) {
                     char fn[160];
                     snprintf(fn,sizeof(fn),"dump_p%d_%llx_%s.bin",pass,(unsigned long long)addr, is_bi?"BI":"raw");

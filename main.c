@@ -75,19 +75,31 @@ static int scan_once(mach_port_name_t task, int dump_all, int pass){
                 double prr = (double)pr/(double)lim;
                 unsigned long ind = countsub(buf,lim,";0;")+countsub(buf,lim,";5;")+countsub(buf,lim,";10;");
                 unsigned long mangled = countsub(buf,lim,"_Z")+countsub(buf,lim,"__Z");
-                // real decrypted bi.txt = high-printable TEXT with many ;N; binding records
-                int is_bi = (ind >= 8) && prr > 0.80 && semi > 100;
-                if (is_bi || dump_all) {
-                    char fn[160];
-                    snprintf(fn,sizeof(fn),"dump_p%d_%llx_%s.bin",pass,(unsigned long long)addr, is_bi?"BI":"raw");
-                    FILE* f=fopen(fn,"wb"); if(f){fwrite(buf,1,(size_t)got,f);fclose(f);dumped++;}
-                    fprintf(stderr,"[%s] @0x%llx sz=0x%llx  ;=%lu _=%lu dig=%lu ind=%lu mZ=%lu pr=%.2f -> %s\n",
-                        is_bi?"BI":"  ",(unsigned long long)addr,(unsigned long long)size,semi,us,dig,ind,mangled,prr,fn);
-                } else if (ind>0 || mangled>5) {
-                    // report interesting-but-not-dumped so we can tune
-                    fprintf(stderr,"[? ] @0x%llx sz=0x%llx ;=%lu _=%lu ind=%lu mZ=%lu pr=%.2f\n",
-                        (unsigned long long)addr,(unsigned long long)size,semi,us,ind,mangled,prr);
+                // WINDOWED: scan this region in 128KB windows to isolate the small bi.txt
+                // TEXT block embedded inside big binary heap regions.
+                unsigned long WIN=128*1024;
+                for (unsigned long w=0; w+4096<=lim; w+=WIN) {
+                    unsigned long wl = (w+WIN<=lim)? WIN : (lim-w);
+                    const unsigned char* wb = buf+w;
+                    unsigned long wsemi=0,wpr=0;
+                    for (unsigned long j=0;j<wl;j++){unsigned char c=wb[j]; if(c==';')wsemi++; if((c>=32&&c<127)||c==9||c==10||c==13)wpr++;}
+                    double wprr=(double)wpr/(double)wl;
+                    unsigned long wind=countsub(wb,wl,";0;")+countsub(wb,wl,";5;")+countsub(wb,wl,";10;");
+                    if (wind>=10 && wprr>0.75 && wsemi>50) {
+                        char fn[160];
+                        snprintf(fn,sizeof(fn),"bi_%llx.bin",(unsigned long long)(addr+w));
+                        FILE* f=fopen(fn,"wb"); if(f){fwrite(wb,1,(size_t)wl,f);fclose(f);dumped++;}
+                        fprintf(stderr,"[BI-WIN] @0x%llx win+0x%lx  ;=%lu ind=%lu pr=%.2f -> %s\n",
+                            (unsigned long long)addr,w,wsemi,wind,wprr,fn);
+                    }
                 }
+                if (dump_all) {
+                    char fn[160]; snprintf(fn,sizeof(fn),"raw_%llx.bin",(unsigned long long)addr);
+                    FILE* f=fopen(fn,"wb"); if(f){fwrite(buf,1,(size_t)got,f);fclose(f);}
+                }
+                if (ind>50)
+                    fprintf(stderr,"[? ] @0x%llx sz=0x%llx ;=%lu ind=%lu mZ=%lu pr=%.2f\n",
+                        (unsigned long long)addr,(unsigned long long)size,semi,ind,mangled,prr);
             }
         }
         addr += size; if (addr==0) break;

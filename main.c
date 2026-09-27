@@ -1,21 +1,23 @@
 // Entitled external memory reader for iOS (jailbroken / roothide)
 // Reads a running process's memory via task_for_pid + mach_vm_read_overwrite
-// (NO code injection, NO ptrace/debugger) -> stealthy vs Promon SHIELD.
-// Hunts the decrypted Promon "bi.txt" (ASCII, ';'-separated records with '_' symbol names)
-// and dumps candidate regions to files.
+// (NO injection, NO ptrace) -> stealthy vs Promon SHIELD.
+// Hunts the decrypted Promon "bi.txt" binding-info (records with ";0;"/";5;"/";10;"
+// indicators and C/C++/ObjC symbol names) and dumps matching regions.
 //
-// Usage:  reader                 -> auto-find "Hay Day" pid
-//         reader <pid>           -> use given pid
-//         reader <pid> all       -> also dump EVERY readable region (big)
+// Usage:
+//   reader                 -> one scan of "Hay Day"
+//   reader <pid|name>      -> one scan of given target
+//   reader <pid|name> loop <seconds>  -> scan repeatedly (catch bi.txt during startup)
+//   reader <pid|name> all  -> dump EVERY readable region (big!)
 //
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <unistd.h>
 #include <mach/mach.h>
 #include <sys/sysctl.h>
 
-// mach_vm_* are not always in the public iOS SDK headers -> declare them.
 extern kern_return_t mach_vm_region(vm_map_t, mach_vm_address_t*, mach_vm_size_t*,
                                     vm_region_flavor_t, vm_region_info_t,
                                     mach_msg_type_number_t*, mach_port_t*);
@@ -32,95 +34,91 @@ static int find_pid(const char* name){
     if (sysctl(mib, 4, procs, &len, NULL, 0) != 0) { free(procs); return -1; }
     int n = (int)(len / sizeof(struct kinfo_proc));
     int pid = -1;
-    for (int i = 0; i < n; i++) {
+    for (int i = 0; i < n; i++)
         if (strncmp(procs[i].kp_proc.p_comm, name, 16) == 0) { pid = procs[i].kp_proc.p_pid; break; }
-    }
     free(procs);
     return pid;
 }
 
-#define CAP (24u*1024u*1024u)   // max bytes read per region
+#define CAP (32u*1024u*1024u)
 
-int main(int argc, char** argv){
-    const char* target = "Hay Day";
-    int pid = -1;
-    int dump_all = 0;
-    if (argc >= 2) {
-        // numeric pid or a name
-        char* end; long v = strtol(argv[1], &end, 10);
-        if (*end == '\0') pid = (int)v; else target = argv[1];
+// count non-overlapping occurrences of needle in [buf,buf+len)
+static unsigned long countsub(const unsigned char* buf, unsigned long len, const char* ndl){
+    unsigned long nl = strlen(ndl), c = 0;
+    if (nl == 0 || len < nl) return 0;
+    for (unsigned long i = 0; i + nl <= len; i++) {
+        unsigned long j = 0;
+        while (j < nl && buf[i+j] == (unsigned char)ndl[j]) j++;
+        if (j == nl) { c++; i += nl - 1; }
     }
-    if (argc >= 3 && strcmp(argv[2], "all") == 0) dump_all = 1;
-    if (pid <= 0) pid = find_pid(target);
-    if (pid <= 0) { fprintf(stderr, "[!] process '%s' not found\n", target); return 1; }
-    fprintf(stderr, "[*] target pid = %d\n", pid);
+    return c;
+}
 
-    mach_port_name_t task = 0;
-    kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
-    if (kr != KERN_SUCCESS) {
-        fprintf(stderr, "[!] task_for_pid failed: kr=%d (%s)\n", kr, mach_error_string(kr));
-        fprintf(stderr, "    (need task_for_pid-allow entitlement honored + run as root)\n");
-        return 2;
-    }
-    fprintf(stderr, "[+] got task port %u\n", task);
-
+static int scan_once(mach_port_name_t task, int dump_all, int pass){
     unsigned char* buf = (unsigned char*)malloc(CAP);
-    if (!buf) { fprintf(stderr, "[!] oom\n"); return 3; }
-
-    mach_vm_address_t addr = 1;
-    mach_vm_size_t size = 0;
-    int region_n = 0, dumped = 0;
-    unsigned long long total_scanned = 0;
-
+    if (!buf) return -1;
+    mach_vm_address_t addr = 1; mach_vm_size_t size = 0;
+    int dumped = 0;
     while (1) {
         vm_region_basic_info_data_64_t info;
         mach_msg_type_number_t infoCnt = VM_REGION_BASIC_INFO_COUNT_64;
         mach_port_t objName = 0;
-        kr = mach_vm_region(task, &addr, &size, VM_REGION_BASIC_INFO_64,
-                            (vm_region_info_t)&info, &infoCnt, &objName);
-        if (kr != KERN_SUCCESS) break;   // no more regions
-        region_n++;
-
-        // only readable regions
+        if (mach_vm_region(task, &addr, &size, VM_REGION_BASIC_INFO_64,
+                           (vm_region_info_t)&info, &infoCnt, &objName) != KERN_SUCCESS) break;
         if (info.protection & VM_PROT_READ) {
-            mach_vm_size_t want = size < CAP ? size : CAP;
-            mach_vm_size_t got = 0;
-            kr = mach_vm_read_overwrite(task, addr, want, (mach_vm_address_t)buf, &got);
-            if (kr == KERN_SUCCESS && got > 0) {
-                total_scanned += got;
-                // score for bi.txt-like text
-                unsigned long semi = 0, us = 0, printable = 0, dig = 0;
-                unsigned long lim = (unsigned long)got;
-                for (unsigned long j = 0; j < lim; j++) {
-                    unsigned char c = buf[j];
-                    if (c == ';') semi++;
-                    else if (c == '_') us++;
-                    else if (c >= '0' && c <= '9') dig++;
-                    if ((c >= 32 && c < 127) || c == 9 || c == 10 || c == 13) printable++;
-                }
-                double pr = lim ? (double)printable / (double)lim : 0.0;
-                int looks_bi = (semi > 200 && us > 50 && pr > 0.80);
-                if (looks_bi || dump_all) {
-                    char fn[128];
-                    snprintf(fn, sizeof(fn), "dump_%llx_%s.bin",
-                             (unsigned long long)addr, looks_bi ? "BI" : "raw");
-                    FILE* f = fopen(fn, "wb");
-                    if (f) { fwrite(buf, 1, (size_t)got, f); fclose(f); dumped++; }
-                    fprintf(stderr,
-                        "[%s] region @0x%llx size=0x%llx read=0x%llx  ; =%lu _=%lu dig=%lu pr=%.2f -> %s\n",
-                        looks_bi ? "BI" : "  ", (unsigned long long)addr,
-                        (unsigned long long)size, (unsigned long long)got, semi, us, dig, pr, fn);
+            mach_vm_size_t want = size < CAP ? size : CAP, got = 0;
+            if (mach_vm_read_overwrite(task, addr, want, (mach_vm_address_t)buf, &got) == KERN_SUCCESS && got > 64) {
+                unsigned long lim = (unsigned long)got, semi=0, us=0, dig=0, pr=0;
+                for (unsigned long j=0;j<lim;j++){ unsigned char c=buf[j];
+                    if(c==';')semi++; else if(c=='_')us++; else if(c>='0'&&c<='9')dig++;
+                    if((c>=32&&c<127)||c==9||c==10||c==13)pr++; }
+                double prr = (double)pr/(double)lim;
+                unsigned long ind = countsub(buf,lim,";0;")+countsub(buf,lim,";5;")+countsub(buf,lim,";10;");
+                unsigned long mangled = countsub(buf,lim,"_Z")+countsub(buf,lim,"__Z");
+                int is_bi = (ind > 20 || mangled > 20) && prr > 0.55 && semi > 50;
+                if (is_bi || dump_all) {
+                    char fn[160];
+                    snprintf(fn,sizeof(fn),"dump_p%d_%llx_%s.bin",pass,(unsigned long long)addr, is_bi?"BI":"raw");
+                    FILE* f=fopen(fn,"wb"); if(f){fwrite(buf,1,(size_t)got,f);fclose(f);dumped++;}
+                    fprintf(stderr,"[%s] @0x%llx sz=0x%llx  ;=%lu _=%lu dig=%lu ind=%lu mZ=%lu pr=%.2f -> %s\n",
+                        is_bi?"BI":"  ",(unsigned long long)addr,(unsigned long long)size,semi,us,dig,ind,mangled,prr,fn);
+                } else if (ind>0 || mangled>5) {
+                    // report interesting-but-not-dumped so we can tune
+                    fprintf(stderr,"[? ] @0x%llx sz=0x%llx ;=%lu _=%lu ind=%lu mZ=%lu pr=%.2f\n",
+                        (unsigned long long)addr,(unsigned long long)size,semi,us,ind,mangled,prr);
                 }
             }
         }
-        addr += size;
-        if (addr == 0) break;
+        addr += size; if (addr==0) break;
     }
     free(buf);
-    fprintf(stderr, "[*] done. regions=%d scanned=%lluMB dumped=%d\n",
-            region_n, total_scanned/(1024*1024), dumped);
-    if (dumped == 0)
-        fprintf(stderr, "[*] no bi.txt-like region found (maybe not decrypted yet / already freed). "
-                        "Run right after launch, or retry a few times.\n");
+    return dumped;
+}
+
+int main(int argc, char** argv){
+    const char* target = "Hay Day"; int pid=-1, dump_all=0, loop_s=0;
+    if (argc>=2){ char* e; long v=strtol(argv[1],&e,10); if(*e=='\0') pid=(int)v; else target=argv[1]; }
+    if (argc>=3 && strcmp(argv[2],"all")==0) dump_all=1;
+    if (argc>=4 && strcmp(argv[2],"loop")==0) loop_s=atoi(argv[3]);
+    if (pid<=0) pid=find_pid(target);
+    if (pid<=0){ fprintf(stderr,"[!] '%s' not found\n",target); return 1; }
+    fprintf(stderr,"[*] target pid=%d\n",pid);
+    mach_port_name_t task=0;
+    kern_return_t kr=task_for_pid(mach_task_self(),pid,&task);
+    if(kr!=KERN_SUCCESS){ fprintf(stderr,"[!] task_for_pid kr=%d (%s)\n",kr,mach_error_string(kr)); return 2; }
+    fprintf(stderr,"[+] task port %u\n",task);
+    if (loop_s>0){
+        int total=0;
+        for(int p=0; p<loop_s*4; p++){   // ~4 scans/sec-ish
+            int d=scan_once(task,dump_all,p);
+            if(d>0){ total+=d; fprintf(stderr,"[*] pass %d dumped %d\n",p,d); }
+            // re-resolve pid could have changed on relaunch; keep same task
+            usleep(250000);
+        }
+        fprintf(stderr,"[*] loop done, total BI dumps=%d\n",total);
+    } else {
+        int d=scan_once(task,dump_all,0);
+        fprintf(stderr,"[*] done. BI dumps=%d\n",d);
+    }
     return 0;
 }
